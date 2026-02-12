@@ -78,14 +78,22 @@ class RotaryPositionalEmbedding(nn.Module):
         self._sin_cache = emb.sin().unsqueeze(0).unsqueeze(0).to(dtype)
         self._cache_len = seq_len
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        offset: int = 0,  # NEW: position offset for KV-cache decoding
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         q, k: (B, num_heads, seq_len, head_dim)
+        offset: starting position index (used during cached inference so that
+                 a single new token at step t gets the correct positional encoding).
         """
         seq_len = q.size(2)
-        self._update_cache(seq_len, q.device, q.dtype)
-        cos = self._cos_cache[:, :, :seq_len, :].to(q.dtype)
-        sin = self._sin_cache[:, :, :seq_len, :].to(q.dtype)
+        total_len = offset + seq_len
+        self._update_cache(total_len, q.device, q.dtype)
+        cos = self._cos_cache[:, :, offset:total_len, :].to(q.dtype)
+        sin = self._sin_cache[:, :, offset:total_len, :].to(q.dtype)
         return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
 
     @staticmethod
@@ -181,6 +189,7 @@ class RoPETransformerEncoderLayer(nn.Module):
         cond: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
+        Full-sequence forward (unchanged from original).
         Args:
             src: Input tensor of shape [B, T, d_model]
             is_causal: If True, applies causal masking via SDPA's is_causal flag
@@ -219,6 +228,72 @@ class RoPETransformerEncoderLayer(nn.Module):
         else:
             src = src + self.ffn(self.ffn_norm(src))
         return src
+
+    # -----------------------------------------------------------------
+    # KV-CACHE: single-step forward for incremental decoding
+    # -----------------------------------------------------------------
+    def forward_cached(
+        self,
+        src: torch.Tensor,               # [B, 1, d_model]  (single new token)
+        cache: Dict[str, torch.Tensor],   # {"k": [B,H,T_past,D], "v": ...}
+        offset: int,                      # number of tokens already in cache
+        cond: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Incremental (cached) forward for one new token.
+
+        Args:
+            src:    [B, 1, d_model] — the new token's hidden state.
+            cache:  per-layer dict with "k" and "v" tensors from previous steps.
+            offset: how many tokens are already cached (= time index of new token).
+            cond:   [B, cond_dim] conditioning vector (or None).
+
+        Returns:
+            (output, updated_cache)
+        """
+        # Pre-norm
+        if self.cond_dim > 0:
+            x = self.self_attn_norm(src, cond)
+        else:
+            x = self.self_attn_norm(src)
+
+        B = x.size(0)
+        # Q, K, V for the single new token  [B, H, 1, D]
+        q = self.w_q(x).view(B, 1, self.nhead, self.head_dim).transpose(1, 2)
+        k_new = self.w_k(x).view(B, 1, self.nhead, self.head_dim).transpose(1, 2)
+        v_new = self.w_v(x).view(B, 1, self.nhead, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE with correct position offset
+        q, k_new = self.rope(q, k_new, offset=offset)
+
+        # Concatenate new K/V to cache
+        if cache["k"].size(2) == 0:
+            k_all = k_new
+            v_all = v_new
+        else:
+            k_all = torch.cat([cache["k"], k_new], dim=2)  # [B,H,T_past+1,D]
+            v_all = torch.cat([cache["v"], v_new], dim=2)
+
+        # Update cache
+        cache = {"k": k_all, "v": v_all}
+
+        # Attention: Q(new) vs K/V(all past + new) — no causal mask needed
+        # because new token is the last one and cache only has past tokens.
+        attn_out = F.scaled_dot_product_attention(
+            q, k_all, v_all,
+            attn_mask=None,
+            dropout_p=0.0,       # no dropout at inference
+            is_causal=False,     # single query against all past — no future exists
+        )
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, 1, self.d_model)
+        src = src + self.w_o(attn_out)
+
+        # Pre-norm FFN
+        if self.cond_dim > 0:
+            src = src + self.ffn(self.ffn_norm(src, cond))
+        else:
+            src = src + self.ffn(self.ffn_norm(src))
+        return src, cache
 
 
 # =============================================================================
@@ -371,7 +446,7 @@ class CausalStitcher1D(nn.Module):
 
 
 # =============================================================================
-# GPT Model (Flash Attention Optimized)
+# GPT Model (Flash Attention Optimized, KV-Cache for Inference)
 # =============================================================================
 
 class GPT(nn.Module):
@@ -382,7 +457,7 @@ class GPT(nn.Module):
     OPTIMIZATIONS:
     - Flash Attention enabled via is_causal flag (no explicit mask)
     - Optional torch.compile() support
-    - Pre-registered buffers for STFT windows
+    - KV-cache for fast autoregressive rollout inference
     """
 
     def __init__(
@@ -511,6 +586,9 @@ class GPT(nn.Module):
                 dropout=stitcher_dropout,
             )
 
+    # =================================================================
+    # ORIGINAL: Full-sequence forward (training / teacher-forced eval)
+    # =================================================================
     def forward(self, x_time: torch.Tensor, 
                 x_freq: torch.Tensor, 
                 is_causal: bool = False, 
@@ -577,6 +655,230 @@ class GPT(nn.Module):
             out = self.stitcher(out.transpose(1, 2)).transpose(1, 2)  # [B, C, L] -> [B, L, C]
 
         return out
+
+    # =================================================================
+    # KV-CACHE: Helper types and methods for fast autoregressive rollout
+    # =================================================================
+
+    # Cache type: list of per-layer dicts, one per encoder layer.
+    # Each dict has {"k": Tensor[B,H,T_cached,D], "v": Tensor[B,H,T_cached,D]}.
+    KVCache = List[Dict[str, torch.Tensor]]
+
+    def init_kv_cache(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> "GPT.KVCache":
+        """
+        Create an empty KV cache (one entry per encoder layer).
+        """
+        cache: GPT.KVCache = []
+        for _ in self.encoder_layers:
+            cache.append({
+                "k": torch.zeros(batch_size, self.num_heads, 0, self.d_model // self.num_heads,
+                                 device=device, dtype=dtype),
+                "v": torch.zeros(batch_size, self.num_heads, 0, self.d_model // self.num_heads,
+                                 device=device, dtype=dtype),
+            })
+        return cache
+
+    def _embed_single_token(
+        self,
+        x_time: torch.Tensor,   # [B, 1, C, K]
+        x_freq: torch.Tensor,   # [B, 1, C, F]
+    ) -> torch.Tensor:
+        """
+        Embed a single token pair (time + freq) and fuse.
+        Returns: [B, 1, d_model]
+        """
+        h_time = self.time_token_embed(x_time)       # [B, 1, d_model]
+        h_freq = self.frequency_token_embed(x_freq)   # [B, 1, d_model]
+
+        # Fuse — for single token, cross-attention degenerates to add
+        if self.fusion_type == "concat":
+            h = torch.cat([h_time, h_freq], dim=-1)
+            h = self.fusion(h)
+        elif self.fusion_type == "add":
+            h = self.fusion(h_time + h_freq)
+        elif self.fusion_type == "cross_attention":
+            # Single-token: cross-attn with T=1 is just element-wise, so fallback to add
+            h = self.fusion(h_time + h_freq)
+        return h
+
+    def forward_step(
+        self,
+        x_time_new: torch.Tensor,     # [B, 1, C, K] single new time token
+        x_freq_new: torch.Tensor,     # [B, 1, C, F] single new freq token
+        cache: "GPT.KVCache",
+        theta: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, "GPT.KVCache"]:
+        """
+        Incremental forward for ONE new token using KV cache.
+        Used during autoregressive rollout inference.
+
+        Args:
+            x_time_new: [B, 1, C, K]
+            x_freq_new: [B, 1, C, F]
+            cache:      list of per-layer {"k", "v"} from previous steps.
+            theta:      [B, theta_dim] conditioning (optional).
+
+        Returns:
+            y_new:  [B, K, C]  — predicted samples for this token.
+            cache:  updated cache (keys/values appended for new token).
+        """
+        # 1. Embed the new token  [B, 1, d_model]
+        h = self._embed_single_token(x_time_new, x_freq_new)
+
+        # 2. Conditioning
+        cond = None
+        if self.theta_dim > 0:
+            if theta is None:
+                raise ValueError("theta must be provided when theta_dim > 0")
+            cond = self.cond_mlp(theta)  # [B, cond_dim]
+
+        # 3. Run through each layer with cache
+        offset = cache[0]["k"].size(2)  # number of tokens already cached
+        new_cache: GPT.KVCache = []
+        for layer, layer_cache in zip(self.encoder_layers, cache):
+            h, updated = layer.forward_cached(h, layer_cache, offset=offset, cond=cond)
+            new_cache.append(updated)
+
+        # 4. Prediction head  [B, 1, C*K] → [B, K, C]
+        out = self.pred_head(h)  # [B, 1, C*K]
+        B = out.size(0)
+        out = out.view(B, self.kernel_size, self.in_channels)  # [B, K, C]
+
+        # NOTE: stitcher is NOT applied per-step; it operates on the full
+        # output sequence and should be applied after rollout if needed.
+        return out, new_cache
+
+    @torch.no_grad()
+    def rollout_cached(
+        self,
+        context_time: torch.Tensor,     # [B, T_ctx, C, K]
+        context_freq: torch.Tensor,     # [B, T_ctx, C, F]
+        n_future: int,
+        theta: Optional[torch.Tensor] = None,
+        freq_from_pred: Optional[Any] = None,  # optional callable: pred_samples → freq token
+    ) -> torch.Tensor:
+        """
+        Autoregressive rollout using KV cache.
+
+        1. Feeds context tokens one-by-one to populate the cache.
+        2. Generates `n_future` tokens step-by-step.
+
+        Args:
+            context_time: [B, T_ctx, C, K] context tokens (time domain).
+            context_freq: [B, T_ctx, C, F] context tokens (freq domain).
+            n_future:     number of future tokens to generate.
+            theta:        [B, theta_dim] conditioning.
+            freq_from_pred: optional callable(pred [B,K,C]) → freq_tok [B,1,C,F].
+                            If None, uses zeros for freq during generation.
+
+        Returns:
+            preds: [B, n_future, K, C] — predicted future tokens (before stitcher).
+        """
+        B, T_ctx, C, K = context_time.shape
+        device = context_time.device
+        dtype = context_time.dtype
+
+        cache = self.init_kv_cache(B, device, dtype)
+
+        # --- Phase 1: feed context tokens to build the cache ---
+        for t in range(T_ctx):
+            xt = context_time[:, t : t + 1]  # [B, 1, C, K]
+            xf = context_freq[:, t : t + 1]  # [B, 1, C, F]
+            _, cache = self.forward_step(xt, xf, cache, theta=theta)
+
+        # --- Phase 2: generate future tokens autoregressively ---
+        preds = []
+        # Use the last context token's prediction as the first "input" for generation
+        # (or re-predict it — here we just start generating from scratch after context)
+        # We need an input token for each step; use last context token as seed.
+        last_time = context_time[:, -1:]  # [B, 1, C, K]
+        last_freq = context_freq[:, -1:]  # [B, 1, C, F]
+
+        for step in range(n_future):
+            if step == 0:
+                xt = last_time
+                xf = last_freq
+            else:
+                # Build input token from previous prediction
+                xt = prev_pred.unsqueeze(1)  # [B, 1, K, C] → need [B, 1, C, K]
+                xt = xt.permute(0, 1, 3, 2)  # [B, 1, C, K]
+                if freq_from_pred is not None:
+                    xf = freq_from_pred(prev_pred)  # user-supplied
+                else:
+                    xf = torch.zeros(B, 1, C, K, device=device, dtype=dtype)
+
+            pred, cache = self.forward_step(xt, xf, cache, theta=theta)
+            preds.append(pred)              # [B, K, C]
+            prev_pred = pred                # for next step's input
+
+        # Stack: [B, n_future, K, C]
+        return torch.stack(preds, dim=1)
+
+    def apply_stitcher(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Apply stitcher to a batch of predicted tokens (post-rollout utility).
+        Args:
+            tokens: [B, T, K, C]
+        Returns:
+            smoothed: [B, T*K, C]
+        """
+        B, T, K, C = tokens.shape
+        out = tokens.reshape(B, T * K, C)
+        if self.use_stitcher:
+            out = self.stitcher(out.transpose(1, 2)).transpose(1, 2)
+        return out
+
+
+# =============================================================================
+# KV-Cache Sanity Check
+# =============================================================================
+
+@torch.no_grad()
+def sanity_check_kv_cache(model: GPT, device: torch.device = torch.device("cpu")):
+    """
+    Compare cached step-by-step output vs full-sequence forward.
+    Asserts max absolute error < 1e-4 (fp32). Call in eval mode.
+
+    Usage:
+        model.eval()
+        sanity_check_kv_cache(model, device=torch.device("cuda"))
+    """
+    model.eval()
+    B, T, C, K = 2, 8, model.in_channels, model.kernel_size
+    dtype = torch.float32
+
+    x_time = torch.randn(B, T, C, K, device=device, dtype=dtype)
+    x_freq = torch.randn(B, T, C, K, device=device, dtype=dtype)
+    theta = torch.randn(B, model.theta_dim, device=device, dtype=dtype) if model.theta_dim > 0 else None
+
+    # --- Full-sequence forward (no stitcher for fair comparison) ---
+    # Temporarily disable stitcher
+    orig_stitcher = model.use_stitcher
+    model.use_stitcher = False
+    full_out = model(x_time, x_freq, is_causal=True, theta=theta)  # [B, T*K, C]
+    full_tokens = full_out.view(B, T, K, C)
+    model.use_stitcher = orig_stitcher
+
+    # --- Step-by-step cached forward ---
+    cache = model.init_kv_cache(B, device, dtype)
+    step_preds = []
+    for t in range(T):
+        xt = x_time[:, t:t+1]
+        xf = x_freq[:, t:t+1]
+        pred, cache = model.forward_step(xt, xf, cache, theta=theta)
+        step_preds.append(pred)  # [B, K, C]
+    cached_tokens = torch.stack(step_preds, dim=1)  # [B, T, K, C]
+
+    # --- Compare ---
+    max_err = (full_tokens - cached_tokens).abs().max().item()
+    print(f"KV-cache sanity check: max |error| = {max_err:.2e}")
+    assert max_err < 1e-4, f"KV-cache mismatch! max error = {max_err:.2e}"
+    print("✅ KV-cache sanity check passed!")
 
 
 # =============================================================================

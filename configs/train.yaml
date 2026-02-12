@@ -72,6 +72,18 @@ model:
     lr_scheduler_frequency: 1
     lr_scheduler_monitor: null
 
+    # =========================================================
+    # Scheduled Sampling (set ss_enabled: true to activate)
+    # =========================================================
+    ss_enabled: false             # master switch — false preserves original behavior
+    ss_warmup_steps: 2000         # linearly anneal p from p_start → p_end over this many steps
+    ss_p_start: 0.0               # initial probability of feeding back own prediction
+    ss_p_end: 0.2                 # final probability
+    ss_unroll_steps: 2            # number of autoregressive steps per training batch (2–8 rec.)
+    ss_detach_pred: true          # detach predicted tokens when feeding back (stable/minimal)
+    ss_use_cache: false           # use KV-cache during unroll (optional speedup, experimental)
+    ss_focus_fraction: 0.8        # 1.0 = uniform start; <1.0 = sample from last X% (e.g. merger)
+
 data:
   class_path: datasets.data_handling.GWDataModule
   init_args:

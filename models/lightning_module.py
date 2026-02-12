@@ -6,6 +6,10 @@ OPTIMIZATIONS:
 - Flash Attention enabled (via is_causal flag in model)
 - Optional torch.compile() for additional speedup
 - Flash Attention status logging at init
+
+FEATURES:
+- Scheduled sampling with configurable annealing (behind flag)
+- Optional KV-cache usage during scheduled sampling unroll
 """
 from typing import Any, Dict, Optional
 
@@ -72,6 +76,17 @@ class GPTLightning(LightningModule):
         # NEW: torch.compile() options
         use_torch_compile: bool = False,
         compile_mode: str = "reduce-overhead",
+        # =============================================
+        # NEW: Scheduled sampling config (flat args)
+        # =============================================
+        ss_enabled: bool = False,         # master switch
+        ss_warmup_steps: int = 2000,      # linear anneal from p_start to p_end
+        ss_p_start: float = 0.0,          # initial probability of using prediction
+        ss_p_end: float = 0.2,            # final probability
+        ss_unroll_steps: int = 2,         # number of autoregressive unroll steps
+        ss_detach_pred: bool = True,      # detach fed-back predictions (stable training)
+        ss_use_cache: bool = False,       # use KV-cache during unroll (optional speedup)
+        ss_focus_fraction: float = 1.0,   # sample start from last X% of tokens (1.0 = full range)
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -125,9 +140,76 @@ class GPTLightning(LightningModule):
         # Log-Cosh Loss
         self.log_cosh_loss = LogCoshLoss()
 
+        # ----- Scheduled Sampling state -----
+        self.ss_enabled = ss_enabled
+        self.ss_warmup_steps = ss_warmup_steps
+        self.ss_p_start = ss_p_start
+        self.ss_p_end = ss_p_end
+        self.ss_unroll_steps = ss_unroll_steps
+        self.ss_detach_pred = ss_detach_pred
+        self.ss_use_cache = ss_use_cache
+        self.ss_focus_fraction = ss_focus_fraction
+
     def forward(self, x: torch.Tensor, x_fft: torch.Tensor, is_causal: bool = True, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.gpt(x, x_fft, is_causal=is_causal, theta=theta)
 
+    # =================================================================
+    # Frequency features for scheduled sampling (match rollout + dataset)
+    # =================================================================
+    def _compute_freq_features(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Per-token FFT magnitude from time tokens. Matches MergerWindowDataset._freq_features
+        and autoregressive_rollout.freq_features_from_tokens for train–inference consistency.
+        tokens: [B, T, C, K] -> [B, T, C, F]
+        """
+        freq_keep_bins = 8
+        mag = torch.fft.rfft(tokens, dim=-1).abs()
+        mag = torch.log1p(mag)
+        Fkeep = min(freq_keep_bins, mag.shape[-1])
+        return mag[..., :Fkeep]
+
+    # =================================================================
+    # Scheduled sampling probability (linear anneal)
+    # =================================================================
+    def _ss_probability(self) -> float:
+        """Current scheduled-sampling probability (linearly annealed)."""
+        step = self.global_step
+        if step >= self.ss_warmup_steps:
+            return self.ss_p_end
+        frac = step / max(self.ss_warmup_steps, 1)
+        return self.ss_p_start + (self.ss_p_end - self.ss_p_start) * frac
+
+    # =================================================================
+    # Per-token loss helper (shared between full-seq and unroll paths)
+    # =================================================================
+    def _compute_token_loss(
+        self,
+        out: torch.Tensor,   # [B, T, K, C] or subset
+        y: torch.Tensor,     # same shape
+    ) -> torch.Tensor:
+        """Compute energy-weighted per-token loss. Input shapes: [B, T, K, C]."""
+        eps = 1e-6
+        energy = y.pow(2).mean(dim=(2, 3)).sqrt()      # [B, T]
+        alpha = 0.5
+        weights = (energy + eps) ** alpha
+        weights = weights / (weights.mean() + eps)
+
+        residual = out - y
+        if self.time_loss == "mse":
+            base = residual.pow(2)
+        elif self.time_loss == "l1":
+            base = residual.abs()
+        elif self.time_loss == "log_cosh":
+            base = torch.log(torch.cosh(residual + 1e-12))
+        else:
+            raise ValueError("time_loss must be 'mse', 'l1', or 'log_cosh'")
+
+        base = base.mean(dim=(2, 3))                    # [B, T]
+        return (weights * base).mean()
+
+    # =================================================================
+    # Main shared step (teacher forcing)
+    # =================================================================
     def _shared_step(self, batch: dict, prefix: str) -> torch.Tensor:
         x = batch["x"]            # [B, T, C, K]
         x_freq = batch["x_freq"]  # [B, T, ...]
@@ -187,19 +269,170 @@ class GPTLightning(LightningModule):
         # ---------------------------------------------------------
         plain_mse = F.mse_loss(out, y)
 
-        self.log(f"{prefix}_loss", loss, prog_bar=True)
-        self.log(f"{prefix}_mse", plain_mse)
-        self.log(f"{prefix}_energy_mean", energy.mean())
-        self.log(f"{prefix}_energy_min", energy.min())
-        self.log(f"{prefix}_energy_max", energy.max())
+        self.log(f"{prefix}_loss", loss, prog_bar=True, sync_dist=True)
+        self.log(f"{prefix}_mse", plain_mse, sync_dist=True)
+        self.log(f"{prefix}_energy_mean", energy.mean(), sync_dist=True)
+        self.log(f"{prefix}_energy_min", energy.min(), sync_dist=True)
+        self.log(f"{prefix}_energy_max", energy.max(), sync_dist=True)
 
         with torch.no_grad():
-            self.log(f"{prefix}_pred_std", out.std())
-            self.log(f"{prefix}_target_std", y.std())
+            self.log(f"{prefix}_pred_std", out.std(), sync_dist=True)
+            self.log(f"{prefix}_target_std", y.std(), sync_dist=True)
 
         return loss
 
+    # =================================================================
+    # Scheduled sampling unroll (training only)
+    # =================================================================
+    def _scheduled_sampling_step(self, batch: dict) -> torch.Tensor:
+        """
+        Short autoregressive unroll with scheduled sampling.
+
+        Strategy:
+          1. Run full teacher-forced forward to get the base loss (unchanged).
+          2. Additionally, do a short unroll of `ss_unroll_steps` tokens from a
+             random split point, mixing predictions back with probability p.
+          3. Combine the two losses.
+
+        This keeps the teacher-forced gradient signal intact while also exposing
+        the model to its own predictions.
+        """
+        x = batch["x"]            # [B, T, C, K]
+        x_freq = batch["x_freq"]  # [B, T, C, F]
+        y = batch["y"]            # [B, T*K, C]
+        theta = batch["theta"]    # [B, theta_dim]
+
+        B, T_total, C, K = x.shape
+        p = self._ss_probability()
+        self.log("ss_p", p, prog_bar=True)
+
+        # ---- 1. Full teacher-forced loss (always computed) ----
+        tf_loss = self._shared_step(batch, "train")
+
+        # Not enough tokens to unroll — just return teacher-forced loss
+        if T_total < self.ss_unroll_steps + 2:
+            return tf_loss
+
+        # ---- 2. Short autoregressive unroll ----
+        y_tok = y.view(B, T_total, K, C)  # [B, T, K, C]
+
+        # Pick a random starting point (optionally focus on last X% of tokens, e.g. merger)
+        max_start = T_total - self.ss_unroll_steps - 1
+        start_min = max(0, min(max_start, int(T_total * (1.0 - self.ss_focus_fraction))))
+        start = torch.randint(start_min, max_start + 1, (1,)).item()
+
+        # Context: everything up to `start` (teacher-forced embedding)
+        # We do a full forward up to `start` to get the transformer hidden states,
+        # then unroll from there. For simplicity (and to avoid re-implementing the
+        # full embedding pipeline token-by-token), we use the model's forward_step
+        # with KV-cache if enabled, or a simple per-step forward otherwise.
+
+        unroll_losses = []
+        cond = None
+        if self.gpt.theta_dim > 0 and theta is not None:
+            cond = self.gpt.cond_mlp(theta)
+
+        if self.ss_use_cache:
+            # --- Cache-accelerated unroll ---
+            cache = self.gpt.init_kv_cache(B, x.device, x.dtype)
+
+            # Feed context tokens [0, start] into cache
+            for t in range(start + 1):
+                _, cache = self.gpt.forward_step(
+                    x[:, t:t+1], x_freq[:, t:t+1], cache, theta=theta
+                )
+
+            # Unroll for ss_unroll_steps tokens
+            cur_time = x[:, start:start+1]    # [B, 1, C, K]
+            cur_freq = x_freq[:, start:start+1]
+            for s in range(self.ss_unroll_steps):
+                idx = start + 1 + s
+                if idx >= T_total:
+                    break
+
+                pred, cache = self.gpt.forward_step(
+                    cur_time, cur_freq, cache, theta=theta
+                )  # pred: [B, K, C]
+
+                # Loss for this token: pred [B,K,C] → [B,1,K,C]
+                gt = y_tok[:, idx]  # [B, K, C]
+                token_loss = self._compute_token_loss(
+                    pred.unsqueeze(1),  # [B, 1, K, C]
+                    gt.unsqueeze(1),
+                )
+                unroll_losses.append(token_loss)
+
+                # Decide: use prediction or ground truth as next input (match inference rollout)
+                if torch.rand(1).item() < p:
+                    # Use model's own prediction — freq from same token (match rollout)
+                    feedback = pred.detach() if self.ss_detach_pred else pred
+                    cur_time = feedback.unsqueeze(1).permute(0, 1, 3, 2)  # [B,1,C,K]
+                    cur_freq = self._compute_freq_features(cur_time)  # [B,1,C,F]
+                else:
+                    # Use ground truth (teacher forcing)
+                    if idx < T_total:
+                        cur_time = x[:, idx:idx+1]
+                        cur_freq = x_freq[:, idx:idx+1]
+        else:
+            # --- Simple unroll without cache (re-embeds each step) ---
+            # Less efficient but simpler; uses full forward over a growing window.
+            # For small unroll_steps (2-4), the overhead is minimal.
+
+            for s in range(self.ss_unroll_steps):
+                idx = start + 1 + s
+                if idx >= T_total:
+                    break
+
+                # Build the input sequence up to idx (using potentially mixed tokens)
+                if s == 0:
+                    # First unroll step: use original context up to idx
+                    x_window = x[:, :idx+1]
+                    f_window = x_freq[:, :idx+1]
+                else:
+                    # We already have x_window from previous iteration;
+                    # append the next token (either pred or gt)
+                    x_window = torch.cat([x_window, next_tok_time], dim=1)
+                    f_window = torch.cat([f_window, next_tok_freq], dim=1)
+
+                # Full forward over the window (causal attention handles masking)
+                out_window = self.gpt(x_window, f_window, is_causal=True, theta=theta)
+                # Extract last token's prediction
+                last_pred = out_window[:, -K:]  # [B, K, C]
+
+                # Loss against ground truth
+                gt = y_tok[:, idx]  # [B, K, C]
+                token_loss = self._compute_token_loss(
+                    last_pred.unsqueeze(1),  # [B, 1, K, C]
+                    gt.unsqueeze(1),
+                )
+                unroll_losses.append(token_loss)
+
+                # Decide next input token (match inference rollout)
+                if torch.rand(1).item() < p:
+                    feedback = last_pred.detach() if self.ss_detach_pred else last_pred
+                    next_tok_time = feedback.unsqueeze(1).permute(0, 1, 3, 2)  # [B,1,C,K]
+                    next_tok_freq = self._compute_freq_features(next_tok_time)  # [B,1,C,F]
+                else:
+                    next_tok_time = x[:, idx:idx+1]
+                    next_tok_freq = x_freq[:, idx:idx+1]
+
+        # ---- 3. Combine losses ----
+        if unroll_losses:
+            ss_loss = torch.stack(unroll_losses).mean()
+            # Weighted combination: teacher-forced loss dominates, unroll is auxiliary
+            total_loss = tf_loss + 0.5 * ss_loss
+            self.log("train_ss_loss", ss_loss)
+        else:
+            total_loss = tf_loss
+
+        return total_loss
+
+    # =================================================================
+    # Training / validation steps
+    # =================================================================
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        if self.ss_enabled:
+            return self._scheduled_sampling_step(batch)
         return self._shared_step(batch, "train")
 
     def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:

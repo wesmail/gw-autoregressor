@@ -29,6 +29,11 @@ Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A caus
 
 - **Training:** PyTorch Lightning; loss is **energy-weighted** (e.g. MSE or L1 over token residuals, weighted by per-token RMS). Config-driven via `LightningCLI` (see `configs/train.yaml`).
 
+- **Scheduled sampling (optional):** When `ss_enabled: true`, training can mix **teacher forcing** with short **autoregressive unrolls**: at each unroll step, with probability *p* the model feeds back its own prediction (otherwise ground truth). This is aligned with inference rollout:
+  - **Frequency features** for predicted tokens are recomputed from the same time token (FFT magnitude, log1p, first 8 bins), matching `autoregressive_rollout.py` and the dataset — no zero tensors, so train and inference see the same input distribution.
+  - **Start position** can be restricted to the last X% of the sequence via `ss_focus_fraction` (default 1.0 = full range; e.g. 0.3 focuses on the merger region).
+  - Config: `ss_warmup_steps`, `ss_p_start`, `ss_p_end`, `ss_unroll_steps`, `ss_detach_pred`, `ss_use_cache`, `ss_focus_fraction`. With `ss_enabled: false`, behavior is unchanged.
+
 - **Evaluation:** `eval_and_plot.py` loads a checkpoint and either (1) **teacher-forced** evaluation or (2) **autoregressive rollout** (context window in seconds/tokens, then generate future tokens). It computes maximised noise-weighted overlap (time and phase), supports PSD from CSV or analytic ET-D, and writes overlap statistics and plots (histograms, CDF, mismatch vs parameters, worst-k waveforms).
 
 ---
