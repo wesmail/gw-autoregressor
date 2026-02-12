@@ -342,6 +342,7 @@ def autoregressive_rollout(
     theta: torch.Tensor,
     n_future_tokens: int,
     max_context_window: Optional[int] = None,
+    use_freq_features: bool = True,
     freq_keep_bins: int = 8,
     freq_log1p: bool = True,
 ) -> torch.Tensor:
@@ -356,8 +357,8 @@ def autoregressive_rollout(
     n_future_tokens : how many tokens to generate
     max_context_window : if set, use a sliding window of this many tokens to
         bound memory/compute during rollout (model has finite max_len).
-    freq_keep_bins, freq_log1p : frequency-feature parameters (must match
-        the training dataset settings; defaults are from MergerWindowDataset).
+    use_freq_features : if False, pass None for x_freq (uni-modal time-only model).
+    freq_keep_bins, freq_log1p : frequency-feature parameters when use_freq_features=True.
 
     Returns
     -------
@@ -382,8 +383,11 @@ def autoregressive_rollout(
         if tokens.shape[1] > max_win:
             tokens = tokens[:, -max_win:]
 
-        # Compute frequency features for current tokens
-        x_freq = compute_freq_features(tokens, freq_keep_bins, freq_log1p)
+        # Compute frequency features for current tokens (or None for uni-modal)
+        if use_freq_features:
+            x_freq = compute_freq_features(tokens, freq_keep_bins, freq_log1p)
+        else:
+            x_freq = None
 
         # Forward pass (causal)
         out = model(tokens, x_freq, is_causal=True, theta=theta)  # [B, T*K, C]
@@ -480,7 +484,9 @@ def run_teacher_forced_inference(
 
     for batch in dataloader:
         x = batch["x"].to(device)
-        x_freq = batch["x_freq"].to(device)
+        x_freq = batch.get("x_freq")
+        if x_freq is not None:
+            x_freq = x_freq.to(device)
         theta = batch["theta"].to(device)
         y = batch["y"]  # [B, L, C]
 
@@ -523,6 +529,7 @@ def run_autoregressive_inference(
     max_context_window: Optional[int] = None,
     max_events: Optional[int] = None,
     use_stitcher: bool = False,
+    use_freq_features: bool = True,
     freq_keep_bins: int = 8,
     freq_log1p: bool = True,
 ) -> dict:
@@ -577,6 +584,7 @@ def run_autoregressive_inference(
         pred_tokens = autoregressive_rollout(
             model, ctx, theta_dev, T_fut,
             max_context_window=max_context_window,
+            use_freq_features=use_freq_features,
             freq_keep_bins=freq_keep_bins,
             freq_log1p=freq_log1p,
         )  # [B, T_fut, C, K]  on device
@@ -982,6 +990,8 @@ def main():
         print(f"  Context:  {T_ctx} tokens = {ctx_s:.4f} s = {T_ctx * stride} samples")
         print(f"  Future:   {T_fut} tokens = {fut_s:.4f} s = {T_fut * stride} samples")
 
+        # Uni-modal (time-only) models have no frequency_token_embed
+        use_freq = getattr(model.gpt, "frequency_token_embed", None) is not None
         results = run_autoregressive_inference(
             model, test_loader, device,
             T_ctx=T_ctx,
@@ -989,6 +999,7 @@ def main():
             max_context_window=args.max_context_window,
             max_events=args.max_events,
             use_stitcher=args.use_stitcher,
+            use_freq_features=use_freq,
         )
 
     t_infer = time.time() - t0

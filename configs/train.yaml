@@ -49,15 +49,18 @@ model:
     token_cnn_layers: 4
     token_cnn_dilation_growth: 2
     token_cnn_dropout: 0.0
-    fusion_type: "add"
     # Post-head stitcher
     use_stitcher: true
     stitcher_hidden: 64
     stitcher_kernel: 5
     stitcher_layers: 2
     stitcher_dropout: 0.0
-    # Loss
+    # Loss: total = time_loss_weight * time_loss + stft_loss_weight * stft_loss
     time_loss: "mse"
+    time_loss_weight: 1.0
+    stft_loss_weight: 0.5
+    stft_n_ffts: [256, 1024, 4096]
+    stft_eps: 1.0e-8
     # conditioning
     theta_dim: 4
     cond_dim: 128

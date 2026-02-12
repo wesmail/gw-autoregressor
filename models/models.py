@@ -376,13 +376,12 @@ class CausalStitcher1D(nn.Module):
 
 class GPT(nn.Module):
     """
-    GPT model for seismic tokens.
-    Uses TokenCausalEmbedding over K (within-token time) instead of 1x1 conv "Embedding".
+    Uni-modal GPT model (time-domain only).
+    Uses TokenEmbedding over K (within-token time). No frequency-domain branch.
     
     OPTIMIZATIONS:
     - Flash Attention enabled via is_causal flag (no explicit mask)
     - Optional torch.compile() support
-    - Pre-registered buffers for STFT windows
     """
 
     def __init__(
@@ -406,9 +405,6 @@ class GPT(nn.Module):
         stitcher_kernel: int = 9,
         stitcher_layers: int = 4,
         stitcher_dropout: float = 0.0,
-
-        # multi-modal fusion type
-        fusion_type: str = "cross_attention",
         # conditioning
         theta_dim: int = 0,
         cond_dim: int = 128,
@@ -433,9 +429,6 @@ class GPT(nn.Module):
         self.stitcher_layers = stitcher_layers
         self.stitcher_dropout = stitcher_dropout
 
-        # Multi-modal fusion type
-        self.fusion_type = fusion_type
-
         self.theta_dim = int(theta_dim)
         self.cond_dim = int(cond_dim)
 
@@ -448,7 +441,7 @@ class GPT(nn.Module):
         else:
             self.cond_mlp = None
 
-        # Causal CNN over K inside each token
+        # Time-domain token embedding only (uni-modal)
         self.time_token_embed = TokenEmbedding(
             in_channels=in_channels,
             d_model=self.d_model,
@@ -458,33 +451,6 @@ class GPT(nn.Module):
             dropout=token_cnn_dropout,
             act=nn.GELU(),
         )
-
-        # Causal CNN over K inside each token
-        self.frequency_token_embed = TokenEmbedding(
-            in_channels=in_channels,
-            d_model=self.d_model,
-            kernel_size=token_cnn_kernel,
-            num_layers=token_cnn_layers,
-            dilation_growth=token_cnn_dilation_growth,
-            dropout=token_cnn_dropout,
-            act=nn.GELU(),
-        )
-
-        # Fusion layer
-        if fusion_type == "concat":
-            self.fusion = nn.Linear(self.d_model * 2, self.d_model)
-        elif fusion_type == "add":
-            self.fusion = nn.LayerNorm(self.d_model)
-        elif fusion_type == "cross_attention":
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=self.d_model,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True,
-            )
-            self.fusion = nn.LayerNorm(self.d_model)
-        else:
-            raise ValueError(f"Unknown fusion_type='{fusion_type}'.")           
 
         # Stack of RoPE encoder layers (Flash Attention optimized)
         layer_cond_dim = self.cond_dim if self.theta_dim > 0 else 0
@@ -511,15 +477,16 @@ class GPT(nn.Module):
                 dropout=stitcher_dropout,
             )
 
-    def forward(self, x_time: torch.Tensor, 
-                x_freq: torch.Tensor, 
-                is_causal: bool = False, 
+    def forward(self, x_time: torch.Tensor,
+                x_freq: Optional[torch.Tensor] = None,
+                is_causal: bool = False,
                 theta: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x_time: Input tensor of shape [B, T, C, K]
-            x_freq: Input tensor of shape [B, T, C, F]
+            x_freq: Unused (kept for API compatibility with eval script; uni-modal uses time only).
             is_causal: If True, uses causal attention (for autoregressive training)
+            theta: Optional conditioning [B, theta_dim]
         
         Returns:
             Predictions of shape [B, T*K, C]
@@ -531,28 +498,11 @@ class GPT(nn.Module):
         if C != self.in_channels or K != self.kernel_size:
             raise ValueError(
                 f"Input has C={C},K={K} but model expects C={self.in_channels},K={self.kernel_size}"
-            )     
+            )
 
-        # Time-domain token embeddings: [B, T, d_model]
-        h_time = self.time_token_embed(x_time)
-        h_time = self.dropout_layer(h_time)
-
-        # Frequency-domain token embeddings: [B, T, d_model]
-        h_freq = self.frequency_token_embed(x_freq)
-        h_freq = self.dropout_layer(h_freq)
-
-        # Fuse modalities
-        if self.fusion_type == "concat":
-            h = torch.cat([h_time, h_freq], dim=-1)  # [B, T, d_model*2]
-            h = self.fusion(h)  # [B, T, d_model]
-        elif self.fusion_type == "add":
-            h = self.fusion(h_time + h_freq)  # [B, T, d_model]
-        elif self.fusion_type == "cross_attention":
-            # Time attends to frequency
-            T = h_time.size(1)
-            attn_mask = torch.triu(torch.ones(T, T, device=h_time.device, dtype=torch.bool), diagonal=1)
-            h_cross, _ = self.cross_attn(h_time, h_freq, h_freq, attn_mask=attn_mask)
-            h = self.fusion(h_time + h_cross)  # [B, T, d_model]
+        # Time-domain token embeddings only (uni-modal): [B, T, d_model]
+        h = self.time_token_embed(x_time)
+        h = self.dropout_layer(h)
 
         cond = None
         if self.theta_dim > 0:
@@ -577,7 +527,6 @@ class GPT(nn.Module):
             out = self.stitcher(out.transpose(1, 2)).transpose(1, 2)  # [B, C, L] -> [B, L, C]
 
         return out
-
 
 # =============================================================================
 # Utility: Compile model with torch.compile() for extra speedup

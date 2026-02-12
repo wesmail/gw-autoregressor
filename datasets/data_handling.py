@@ -39,7 +39,6 @@ class MergerWindowDataset(Dataset):
     Returns dict:
         x:      [T, C, K]   time tokens
         y:      [T*K, C]    targets (next-token waveform)
-        x_fft:  [T, C, F]   per-token FFT magnitude features
         theta:  [4]          conditioning parameters
     """
 
@@ -50,24 +49,12 @@ class MergerWindowDataset(Dataset):
         stride: int = 64,
         n_files: int | None = None,
         n_samples_per_file: int = 10000,
-        pattern: str = "merger_windows_*.h5",
-        freq_keep_bins: int = 8,
-        freq_log1p: bool = True,
     ):
         super().__init__()
 
         self.kernel_size = kernel_size
         self.stride = stride
         self.scale = np.float32(1e24)
-
-        # STFT params (kept for compatibility)
-        self.stft_n_fft = 2 * kernel_size
-        self.stft_hop = stride
-        self.stft_win_length = self.stft_n_fft
-
-        # Frequency features
-        self.freq_keep_bins = int(freq_keep_bins)
-        self.freq_log1p = bool(freq_log1p)
 
         # ── discover files ─────────────────────────────────────────── #
         self.files = sorted(
@@ -134,17 +121,6 @@ class MergerWindowDataset(Dataset):
         self.close_handles()
 
     # ------------------------------------------------------------------ #
-    #  Frequency helper
-    # ------------------------------------------------------------------ #
-    def _freq_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-token FFT magnitude: [T, C, K] → [T, C, F]."""
-        mag = torch.fft.rfft(x, dim=-1).abs()
-        if self.freq_log1p:
-            mag = torch.log1p(mag)
-        Fkeep = min(self.freq_keep_bins, mag.shape[-1])
-        return mag[..., :Fkeep]
-
-    # ------------------------------------------------------------------ #
     #  Dataset interface
     # ------------------------------------------------------------------ #
     def __len__(self):
@@ -168,9 +144,6 @@ class MergerWindowDataset(Dataset):
         x = tokens[:-1]   # [T, C, K]
         y = tokens[1:]     # [T, C, K]
 
-        # Frequency features (no data leakage)
-        x_freq = self._freq_features(x)  # [T, C, F]
-
         # Reshape y → [T*K, C]
         T, C, K = y.shape
         y = y.permute(0, 2, 1).contiguous().view(T * K, C)
@@ -178,7 +151,6 @@ class MergerWindowDataset(Dataset):
         return {
             "x": x,
             "y": y,
-            "x_freq": x_freq,
             "theta": self._theta[item],
         }
 

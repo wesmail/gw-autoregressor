@@ -1,15 +1,16 @@
 """
 PyTorch Lightning module for training the GPT model (time-domain only) with
-time-domain loss (MSE/L1) and multi-resolution STFT loss.
+time-domain loss (MSE/L1/log_cosh) and multi-resolution STFT loss.
 
 OPTIMIZATIONS:
 - Flash Attention enabled (via is_causal flag in model)
 - Optional torch.compile() for additional speedup
 - Flash Attention status logging at init
 """
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch import LightningModule
 
@@ -18,11 +19,50 @@ from .models import GPT, print_flash_attention_status, compile_model
 # =============================================================================
 # Log-Cosh Loss
 # =============================================================================
-import torch.nn as nn
 class LogCoshLoss(nn.Module):
     def forward(self, x, y):  # x, y: [B, T, F]
         diff = x - y
         return torch.mean(torch.log(torch.cosh(diff + 1e-12)))
+
+
+# =============================================================================
+# Multi-Resolution STFT Loss
+# =============================================================================
+class MultiResSTFTLoss(nn.Module):
+    """
+    Multi-resolution STFT magnitude L1 loss.
+    Inputs x, y: [B, C, T]
+    """
+    def __init__(self, n_ffts: Tuple[int, ...] = (256, 1024, 4096), eps: float = 1e-8):
+        super().__init__()
+        self.n_ffts = tuple(n_ffts)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        x, y: [B, C, T]
+        """
+        B, C, T = x.shape
+        loss = x.new_zeros(())
+
+        for n_fft in self.n_ffts:
+            hop = n_fft // 4
+            win = torch.hann_window(n_fft, device=x.device, dtype=torch.float32)
+
+            x_ = x.reshape(B * C, T)
+            y_ = y.reshape(B * C, T)
+
+            X = torch.stft(x_, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                           window=win, center=True, return_complex=True)
+            Y = torch.stft(y_, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                           window=win, center=True, return_complex=True)
+
+            magX = (X.abs() + self.eps)
+            magY = (Y.abs() + self.eps)
+
+            loss = loss + (magX - magY).abs().mean()
+
+        return (loss / float(len(self.n_ffts))).to(x.dtype)
     
 
 class GPTLightning(LightningModule):
@@ -53,9 +93,12 @@ class GPTLightning(LightningModule):
         stitcher_kernel: int = 9,
         stitcher_layers: int = 4,
         stitcher_dropout: float = 0.0,
-        # Loss
+        # Loss: weighted sum of time loss + multi-resolution STFT loss
         time_loss: str = "l1",
-        fusion_type: str = "cross_attention",
+        time_loss_weight: float = 1.0,
+        stft_loss_weight: float = 0.0,
+        stft_n_ffts: Union[Tuple[int, ...], list] = (256, 1024, 4096),
+        stft_eps: float = 1e-8,
         # conditioning
         theta_dim: int = 0,
         cond_dim: int = 128,
@@ -102,7 +145,6 @@ class GPTLightning(LightningModule):
             stitcher_kernel=stitcher_kernel,
             stitcher_layers=stitcher_layers,
             stitcher_dropout=stitcher_dropout,
-            fusion_type=fusion_type,
             theta_dim=theta_dim,
             cond_dim=cond_dim,
             cond_hidden=cond_hidden,
@@ -122,18 +164,23 @@ class GPTLightning(LightningModule):
         self.lr_scheduler_frequency = lr_scheduler_frequency
         self.lr_scheduler_monitor = lr_scheduler_monitor
 
-        # Log-Cosh Loss
+        # Log-Cosh Loss (used when time_loss == "log_cosh")
         self.log_cosh_loss = LogCoshLoss()
 
-    def forward(self, x: torch.Tensor, x_fft: torch.Tensor, is_causal: bool = True, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.gpt(x, x_fft, is_causal=is_causal, theta=theta)
+        # Loss weights
+        self.time_loss_weight = float(time_loss_weight)
+        self.stft_loss_weight = float(stft_loss_weight)
+        n_ffts = tuple(stft_n_ffts) if isinstance(stft_n_ffts, list) else stft_n_ffts
+        self.stft_loss_fn = MultiResSTFTLoss(n_ffts=n_ffts, eps=stft_eps)
+
+    def forward(self, x: torch.Tensor, x_freq: Optional[torch.Tensor] = None, is_causal: bool = True, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.gpt(x, x_freq=x_freq, is_causal=is_causal, theta=theta)
 
     def _shared_step(self, batch: dict, prefix: str) -> torch.Tensor:
         x = batch["x"]            # [B, T, C, K]
-        x_freq = batch["x_freq"]  # [B, T, ...]
         y = batch["y"]            # [B, T*K, C]
         theta = batch["theta"]    # [B, theta_dim]
-        out = self(x, x_freq, is_causal=True, theta=theta)  # [B, T*K, C]
+        out = self(x, x_freq=None, is_causal=True, theta=theta)  # [B, T*K, C]
 
         # ---------------------------------------------------------
         # Reshape to tokens
@@ -178,24 +225,41 @@ class GPTLightning(LightningModule):
         base_loss = base_loss.mean(dim=(2, 3))         # [B, T]
 
         # ---------------------------------------------------------
-        # Energy-weighted loss
+        # Time loss (energy-weighted)
         # ---------------------------------------------------------
-        loss = (weights * base_loss).mean()
+        time_loss_term = (weights * base_loss).mean()
+
+        # ---------------------------------------------------------
+        # Multi-resolution STFT loss (inputs [B, C, T])
+        # ---------------------------------------------------------
+        if self.stft_loss_weight != 0:
+            out_bct = out.transpose(1, 2)   # [B, L, C] -> [B, C, L]
+            y_bct = y.transpose(1, 2)       # [B, L, C] -> [B, C, L]
+            stft_loss_term = self.stft_loss_fn(out_bct, y_bct)
+        else:
+            stft_loss_term = out.new_zeros(())
+
+        # ---------------------------------------------------------
+        # Combined loss
+        # ---------------------------------------------------------
+        loss = self.time_loss_weight * time_loss_term + self.stft_loss_weight * stft_loss_term
 
         # ---------------------------------------------------------
         # Logging
         # ---------------------------------------------------------
         plain_mse = F.mse_loss(out, y)
-
-        self.log(f"{prefix}_loss", loss, prog_bar=True)
-        self.log(f"{prefix}_mse", plain_mse)
-        self.log(f"{prefix}_energy_mean", energy.mean())
-        self.log(f"{prefix}_energy_min", energy.min())
-        self.log(f"{prefix}_energy_max", energy.max())
+        self.log(f"{prefix}_loss", loss, prog_bar=True, sync_dist=True)
+        self.log(f"{prefix}_time_loss", time_loss_term, sync_dist=True)
+        self.log(f"{prefix}_mse", plain_mse, sync_dist=True)
+        if self.stft_loss_weight != 0:
+            self.log(f"{prefix}_stft_loss", stft_loss_term, sync_dist=True)
+        self.log(f"{prefix}_energy_mean", energy.mean(), sync_dist=True)
+        self.log(f"{prefix}_energy_min", energy.min(), sync_dist=True)
+        self.log(f"{prefix}_energy_max", energy.max(), sync_dist=True)
 
         with torch.no_grad():
-            self.log(f"{prefix}_pred_std", out.std())
-            self.log(f"{prefix}_target_std", y.std())
+            self.log(f"{prefix}_pred_std", out.std(), sync_dist=True)
+            self.log(f"{prefix}_target_std", y.std(), sync_dist=True)
 
         return loss
 

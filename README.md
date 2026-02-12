@@ -2,7 +2,7 @@
 
 Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A causal transformer is trained to predict merger-centered strain windows token-by-token, conditioned on binary black hole parameters. Evaluation uses **noise-weighted overlap** (teacher-forced or autoregressive rollout), suitable for Einstein Telescope–style sensitivity.
 
-**Branch:** `main`
+**Branch:** `uni-modal`
 
 ---
 
@@ -12,7 +12,7 @@ Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A caus
   - **Waveforms:** `waveforms/h_plus`, `waveforms/h_cross` — strain time series (h₊, h×) per sample.
   - **Parameters:** `params/mass1`, `params/mass2`, `params/spin1z`, `params/spin2z` — converted to a conditioning vector **θ** = [log(chirp mass), η, s1z, s2z].
 
-- **Tokenization:** Waveforms are scaled (e.g. ×10²⁴), then unfolded into **non-overlapping time tokens** of length `kernel_size` (e.g. 64) with the same `stride`. Each sample yields input tokens **x** [T, C, K], next-token targets **y** [T×K, C], and per-token **frequency features** (low-frequency FFT magnitude bins, optional log1p) for the model.
+- **Tokenization:** Waveforms are scaled (e.g. ×10²⁴), then unfolded into **non-overlapping time tokens** of length `kernel_size` (e.g. 64) with the same `stride`. Each sample yields input tokens **x** [T, C, K] and next-token targets **y** [T×K, C] only (no frequency-domain features on this branch).
 
 - **Dataset:** `MergerWindowDataset` opens HDF5 **lazily** (one handle per DataLoader worker, SWMR) and preloads only the small θ arrays. This keeps memory low while avoiding open/close on every `__getitem__`. HDF5 is not fork-safe; a `worker_init_fn` clears inherited handles so each worker opens files in its own process.
 
@@ -20,14 +20,17 @@ Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A caus
 
 ---
 
-## Model
+## Model (uni-modal, time-domain only)
 
-- **Architecture:** GPT-style **causal transformer** with:
-  - **Token embedding:** Two branches over each token (length K): (1) **time-domain** — dilated 1D CNN + attention pooling over K; (2) **frequency-domain** — same structure on per-token FFT magnitude features. The two are fused (e.g. add or cross-attention) into a single sequence of token embeddings.
+- **Architecture:** GPT-style **causal transformer**, **time-domain only** (no frequency branch):
+  - **Token embedding:** A single **time-domain** branch: dilated 1D CNN + attention pooling over the within-token axis K. Each token [C, K] is embedded to a single vector; no frequency-domain or multi-modal fusion.
   - **Sequence model:** Stack of **RoPE** transformer encoder layers (pre-norm, Flash Attention–friendly: causal masking via `is_causal`, no explicit mask). Optional **conditioning** on θ through an MLP and **AdaLayerNorm** (FiLM-style) in each layer.
   - **Output:** Linear head predicts the next token’s waveform slice → [B, T×K, C]. An optional **causal 1D stitcher** smooths predictions along the sample axis to reduce token-boundary artifacts.
 
-- **Training:** PyTorch Lightning; loss is **energy-weighted** (e.g. MSE or L1 over token residuals, weighted by per-token RMS). Config-driven via `LightningCLI` (see `configs/train.yaml`).
+- **Training:** PyTorch Lightning; loss is a **weighted sum of two terms** (user-defined weights in config):
+  1. **Time loss:** Energy-weighted MSE, L1, or log-cosh over token residuals (weight: `time_loss_weight`).
+  2. **Multi-resolution STFT loss:** L1 on STFT magnitudes at several FFT sizes (e.g. 256, 1024, 4096); weight `stft_loss_weight`, configurable `stft_n_ffts` and `stft_eps`.
+  Config-driven via `LightningCLI` (see `configs/train.yaml`).
 
 - **Evaluation:** `eval_and_plot.py` loads a checkpoint and either (1) **teacher-forced** evaluation or (2) **autoregressive rollout** (context window in seconds/tokens, then generate future tokens). It computes maximised noise-weighted overlap (time and phase), supports PSD from CSV or analytic ET-D, and writes overlap statistics and plots (histograms, CDF, mismatch vs parameters, worst-k waveforms).
 
