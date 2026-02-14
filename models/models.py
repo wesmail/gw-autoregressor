@@ -446,6 +446,34 @@ class CausalStitcher1D(nn.Module):
 
 
 # =============================================================================
+# Lightweight MLP embedding for frequency features (small F bins)
+# =============================================================================
+
+class FreqMLPEmbed(nn.Module):
+    """
+    Maps per-token frequency features [B, T, C, F] -> [B, T, d_model].
+
+    TokenEmbedding (conv-based) is over-parameterized for small F (e.g. F=8).
+    A simple Linear+GELU+LayerNorm is cheaper and sufficient for low-dimensional
+    spectral summaries.
+    """
+
+    def __init__(self, in_channels: int, freq_bins: int, d_model: int):
+        super().__init__()
+        in_dim = in_channels * freq_bins  # flatten C*F per token
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, x_freq: torch.Tensor) -> torch.Tensor:
+        """x_freq: [B, T, C, F] -> [B, T, d_model]"""
+        B, T, C, F = x_freq.shape
+        return self.net(x_freq.reshape(B, T, C * F))
+
+
+# =============================================================================
 # GPT Model (Flash Attention Optimized, KV-Cache for Inference)
 # =============================================================================
 
@@ -484,6 +512,9 @@ class GPT(nn.Module):
 
         # multi-modal fusion type
         fusion_type: str = "cross_attention",
+        # frequency branch: "mlp" (lightweight) or "conv" (legacy TokenEmbedding)
+        freq_embed_type: str = "mlp",
+        freq_keep_bins: int = 8,
         # conditioning
         theta_dim: int = 0,
         cond_dim: int = 128,
@@ -513,6 +544,7 @@ class GPT(nn.Module):
 
         self.theta_dim = int(theta_dim)
         self.cond_dim = int(cond_dim)
+        self.freq_keep_bins = int(freq_keep_bins)
 
         if self.theta_dim > 0:
             self.cond_mlp = nn.Sequential(
@@ -523,7 +555,7 @@ class GPT(nn.Module):
         else:
             self.cond_mlp = None
 
-        # Causal CNN over K inside each token
+        # Time-domain token embedding (causal CNN over K)
         self.time_token_embed = TokenEmbedding(
             in_channels=in_channels,
             d_model=self.d_model,
@@ -534,16 +566,25 @@ class GPT(nn.Module):
             act=nn.GELU(),
         )
 
-        # Causal CNN over K inside each token
-        self.frequency_token_embed = TokenEmbedding(
-            in_channels=in_channels,
-            d_model=self.d_model,
-            kernel_size=token_cnn_kernel,
-            num_layers=token_cnn_layers,
-            dilation_growth=token_cnn_dilation_growth,
-            dropout=token_cnn_dropout,
-            act=nn.GELU(),
-        )
+        # Frequency embedding: MLP (lightweight for small F) or conv (legacy)
+        if freq_embed_type == "mlp":
+            self.frequency_token_embed = FreqMLPEmbed(
+                in_channels=in_channels,
+                freq_bins=freq_keep_bins,
+                d_model=self.d_model,
+            )
+        elif freq_embed_type == "conv":
+            self.frequency_token_embed = TokenEmbedding(
+                in_channels=in_channels,
+                d_model=self.d_model,
+                kernel_size=token_cnn_kernel,
+                num_layers=token_cnn_layers,
+                dilation_growth=token_cnn_dilation_growth,
+                dropout=token_cnn_dropout,
+                act=nn.GELU(),
+            )
+        else:
+            raise ValueError(f"Unknown freq_embed_type='{freq_embed_type}'")
 
         # Fusion layer
         if fusion_type == "concat":
@@ -810,7 +851,8 @@ class GPT(nn.Module):
                 if freq_from_pred is not None:
                     xf = freq_from_pred(prev_pred)  # user-supplied
                 else:
-                    xf = torch.zeros(B, 1, C, K, device=device, dtype=dtype)
+                    F = self.freq_keep_bins
+                    xf = torch.zeros(B, 1, C, F, device=device, dtype=dtype)
 
             pred, cache = self.forward_step(xt, xf, cache, theta=theta)
             preds.append(pred)              # [B, K, C]
@@ -850,10 +892,11 @@ def sanity_check_kv_cache(model: GPT, device: torch.device = torch.device("cpu")
     """
     model.eval()
     B, T, C, K = 2, 8, model.in_channels, model.kernel_size
+    F = model.freq_keep_bins
     dtype = torch.float32
 
     x_time = torch.randn(B, T, C, K, device=device, dtype=dtype)
-    x_freq = torch.randn(B, T, C, K, device=device, dtype=dtype)
+    x_freq = torch.randn(B, T, C, F, device=device, dtype=dtype)
     theta = torch.randn(B, model.theta_dim, device=device, dtype=dtype) if model.theta_dim > 0 else None
 
     # --- Full-sequence forward (no stitcher for fair comparison) ---

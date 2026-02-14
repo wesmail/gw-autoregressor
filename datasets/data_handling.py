@@ -13,6 +13,52 @@ from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader, random_split
 
 
+# =============================================================================
+# Utility: compute per-token FFT features (used by dataset AND rollout/inference)
+# =============================================================================
+_FREQ_EPS = 1e-6
+
+
+def freq_features_from_tokens(
+    x_time: torch.Tensor,
+    freq_keep_bins: int = 8,
+    freq_log1p: bool = True,
+    freq_norm: str = "none",
+) -> torch.Tensor:
+    """
+    Compute per-token FFT magnitude features from time tokens (NO leakage).
+
+    Shared between dataset preprocessing and autoregressive rollout so that
+    frequency features are always computed identically (rollout parity).
+
+    Args:
+        x_time: [..., C, K]  — last two dims are channels and within-token samples.
+        freq_keep_bins: F, number of low-frequency rFFT bins to keep per channel.
+        freq_log1p: apply log(1 + |FFT|) compression.
+        freq_norm: "none" | "mean" | "l2" — per-token spectrum normalization.
+
+    Returns:
+        mag: [..., C, F]  same leading dims as input.
+    """
+    X = torch.fft.rfft(x_time, dim=-1)   # [..., C, K//2+1] complex
+    mag = X.abs()                          # [..., C, K//2+1]
+
+    if freq_log1p:
+        mag = torch.log1p(mag)
+
+    Fkeep = min(freq_keep_bins, mag.shape[-1])
+    mag = mag[..., :Fkeep]                 # [..., C, F]
+
+    if freq_norm == "mean":
+        mag = mag / (mag.mean(dim=-1, keepdim=True) + _FREQ_EPS)
+    elif freq_norm == "l2":
+        mag = mag / (mag.pow(2).sum(dim=-1, keepdim=True).sqrt() + _FREQ_EPS)
+    elif freq_norm != "none":
+        raise ValueError(f"Unknown freq_norm='{freq_norm}', expected 'none'|'mean'|'l2'")
+
+    return mag
+
+
 def compute_theta(m1, m2, s1z, s2z):
     """Convert raw params → conditioning vector θ."""
     M = m1 + m2
@@ -53,6 +99,8 @@ class MergerWindowDataset(Dataset):
         pattern: str = "merger_windows_*.h5",
         freq_keep_bins: int = 8,
         freq_log1p: bool = True,
+        freq_norm: str = "none",   # "none" | "mean" | "l2"
+        max_samples: int | None = None,
     ):
         super().__init__()
 
@@ -65,9 +113,13 @@ class MergerWindowDataset(Dataset):
         self.stft_hop = stride
         self.stft_win_length = self.stft_n_fft
 
-        # Frequency features
+        # Frequency features (shared with rollout via freq_features_from_tokens)
         self.freq_keep_bins = int(freq_keep_bins)
         self.freq_log1p = bool(freq_log1p)
+        self.freq_norm = str(freq_norm)
+
+        # Max samples
+        self.max_samples = max_samples
 
         # ── discover files ─────────────────────────────────────────── #
         self.files = sorted(
@@ -134,15 +186,16 @@ class MergerWindowDataset(Dataset):
         self.close_handles()
 
     # ------------------------------------------------------------------ #
-    #  Frequency helper
+    #  Frequency helper (uses shared util for rollout parity)
     # ------------------------------------------------------------------ #
-    def _freq_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-token FFT magnitude: [T, C, K] → [T, C, F]."""
-        mag = torch.fft.rfft(x, dim=-1).abs()
-        if self.freq_log1p:
-            mag = torch.log1p(mag)
-        Fkeep = min(self.freq_keep_bins, mag.shape[-1])
-        return mag[..., :Fkeep]
+    def _freq_features_from_time_tokens(self, x_time: torch.Tensor) -> torch.Tensor:
+        """Per-token FFT magnitude: [T, C, K] → [T, C, F]. Uses freq_features_from_tokens for parity with rollout."""
+        return freq_features_from_tokens(
+            x_time,
+            freq_keep_bins=self.freq_keep_bins,
+            freq_log1p=self.freq_log1p,
+            freq_norm=self.freq_norm,
+        )
 
     # ------------------------------------------------------------------ #
     #  Dataset interface
@@ -158,6 +211,10 @@ class MergerWindowDataset(Dataset):
         hp = h5["waveforms"]["h_plus"][sample_idx].astype(np.float32)
         hc = h5["waveforms"]["h_cross"][sample_idx].astype(np.float32)
 
+        if self.max_samples is not None:
+            hp = hp[:self.max_samples]
+            hc = hc[:self.max_samples]
+
         # [L, 2] float32, scaled in-place
         waveform = np.stack([hp, hc], axis=-1)
         waveform *= self.scale
@@ -168,8 +225,8 @@ class MergerWindowDataset(Dataset):
         x = tokens[:-1]   # [T, C, K]
         y = tokens[1:]     # [T, C, K]
 
-        # Frequency features (no data leakage)
-        x_freq = self._freq_features(x)  # [T, C, F]
+        # Frequency features (no data leakage; same as rollout)
+        x_freq = self._freq_features_from_time_tokens(x)  # [T, C, F]
 
         # Reshape y → [T*K, C]
         T, C, K = y.shape
@@ -215,6 +272,10 @@ class GWDataModule(LightningDataModule):
         stride: int = 64,
         batch_size: int = 32,
         num_workers: int = 4,
+        freq_keep_bins: int = 8,
+        freq_log1p: bool = True,
+        freq_norm: str = "none",
+        max_samples: int | None = 57500,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -224,6 +285,10 @@ class GWDataModule(LightningDataModule):
         self.stride = stride
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.freq_keep_bins = freq_keep_bins
+        self.freq_log1p = freq_log1p
+        self.freq_norm = freq_norm
+        self.max_samples = max_samples
         self.save_hyperparameters()
 
     def setup(self, stage=None):
@@ -233,6 +298,10 @@ class GWDataModule(LightningDataModule):
             stride=self.stride,
             n_files=self.n_files,
             n_samples_per_file=self.n_samples_per_file,
+            freq_keep_bins=self.freq_keep_bins,
+            freq_log1p=self.freq_log1p,
+            freq_norm=self.freq_norm,
+            max_samples=self.max_samples,
         )
         train_len = int(0.8 * len(full_dataset))
         val_len = int(0.1 * len(full_dataset))

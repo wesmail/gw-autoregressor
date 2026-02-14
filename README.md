@@ -2,39 +2,43 @@
 
 Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A causal transformer is trained to predict merger-centered strain windows token-by-token, conditioned on binary black hole parameters. Evaluation uses **noise-weighted overlap** (teacher-forced or autoregressive rollout), suitable for Einstein Telescope–style sensitivity.
 
-**Branch:** `main`
+**Branch:** `dev`
 
 ---
 
 ## Data & Data Handling
 
-- **Source:** HDF5 files in a single directory (e.g. `merger_windows_*.h5`). Each file contains:
+- **Source:** HDF5 files in a single directory (any `*.h5`). Each file contains:
   - **Waveforms:** `waveforms/h_plus`, `waveforms/h_cross` — strain time series (h₊, h×) per sample.
   - **Parameters:** `params/mass1`, `params/mass2`, `params/spin1z`, `params/spin2z` — converted to a conditioning vector **θ** = [log(chirp mass), η, s1z, s2z].
 
-- **Tokenization:** Waveforms are scaled (e.g. ×10²⁴), then unfolded into **non-overlapping time tokens** of length `kernel_size` (e.g. 64) with the same `stride`. Each sample yields input tokens **x** [T, C, K], next-token targets **y** [T×K, C], and per-token **frequency features** (low-frequency FFT magnitude bins, optional log1p) for the model.
+- **Tokenization:** Waveforms are scaled by 10²⁴, then unfolded into **non-overlapping time tokens** of length `kernel_size` with the same `stride` (e.g. 64). Optionally, each waveform is truncated to `max_samples` time steps (e.g. 57500). Each sample yields:
+  - **x** [T, C, K] — input time tokens (C=2 for h₊, h×).
+  - **y** [T×K, C] — next-token targets (flattened).
+  - **x_freq** [T, C, F] — per-token **frequency features**: low-frequency rFFT magnitude bins (first `freq_keep_bins`, e.g. 4), with optional `log1p` and normalization (`freq_norm`: `"none"` | `"mean"` | `"l2"`). Computed via `freq_features_from_tokens()` so dataset, training (scheduled sampling), and inference rollout use the same recipe and avoid leakage.
 
-- **Dataset:** `MergerWindowDataset` opens HDF5 **lazily** (one handle per DataLoader worker, SWMR) and preloads only the small θ arrays. This keeps memory low while avoiding open/close on every `__getitem__`. HDF5 is not fork-safe; a `worker_init_fn` clears inherited handles so each worker opens files in its own process.
+- **Dataset:** `MergerWindowDataset` opens HDF5 **lazily** (one handle per DataLoader worker, SWMR) and **preloads only θ** from all files (tiny memory). This avoids loading full waveforms into RAM and avoids open/close on every `__getitem__`. HDF5 is not fork-safe; `worker_init_fn` clears inherited handles so each worker opens files in its own process. Config: `n_files`, `n_samples_per_file`, `kernel_size`, `stride`, `freq_keep_bins`, `freq_log1p`, `freq_norm`, `max_samples`.
 
-- **DataModule:** `GWDataModule` builds the dataset and splits it **80/10/10** train/val/test, and provides DataLoaders with optional `num_workers`, `pin_memory`, and `persistent_workers`.
+- **DataModule:** `GWDataModule` builds the dataset and splits it **80/10/10** train/val/test, and provides DataLoaders with `num_workers`, `pin_memory`, `persistent_workers`, and `worker_init_fn`.
 
 ---
 
 ## Model
 
-- **Architecture:** GPT-style **causal transformer** with:
-  - **Token embedding:** Two branches over each token (length K): (1) **time-domain** — dilated 1D CNN + attention pooling over K; (2) **frequency-domain** — same structure on per-token FFT magnitude features. The two are fused (e.g. add or cross-attention) into a single sequence of token embeddings.
-  - **Sequence model:** Stack of **RoPE** transformer encoder layers (pre-norm, Flash Attention–friendly: causal masking via `is_causal`, no explicit mask). Optional **conditioning** on θ through an MLP and **AdaLayerNorm** (FiLM-style) in each layer.
-  - **Output:** Linear head predicts the next token’s waveform slice → [B, T×K, C]. An optional **causal 1D stitcher** smooths predictions along the sample axis to reduce token-boundary artifacts.
+- **Architecture:** GPT-style **causal transformer** (`models/models.py`):
+  - **Token embedding:** Two branches per token (length K):
+    - **Time:** `TokenEmbedding` — dilated 1D CNN over K + attention pooling → [B, T, d_model].
+    - **Frequency:** `FreqMLPEmbed` (or legacy conv) on per-token FFT features [B, T, C, F] → [B, T, d_model].
+  - **Fusion:** Time and frequency embeddings are combined via `fusion_type`: `"concat"` (default), `"add"`, or `"cross_attention"` → single sequence [B, T, d_model].
+  - **Conditioning:** **θ** [B, 4] is mapped by an MLP to `cond_dim` and injected into every transformer layer via **AdaLayerNorm** (FiLM-style).
+  - **Sequence:** Stack of **RoPE** transformer encoder layers (pre-norm; causal masking via `is_causal`, no explicit mask, so Flash Attention can be used). Optional **KV-cache** for fast autoregressive decoding.
+  - **Output:** Linear head → next-token waveform slice [B, T×K, C]. Optional **CausalStitcher1D** smooths along the sample axis to reduce token-boundary artifacts.
 
-- **Training:** PyTorch Lightning; loss is **energy-weighted** (e.g. MSE or L1 over token residuals, weighted by per-token RMS). Config-driven via `LightningCLI` (see `configs/train.yaml`).
+- **Training** (`models/lightning_module.py`): PyTorch Lightning (`GPTLightning`). Loss is **energy-weighted** over token residuals (per-token RMS weight; base loss: `time_loss` = `"mse"` | `"l1"` | `"log_cosh"`). Optimizer: AdamW; optional **CosineAnnealingWarmRestarts** LR scheduler. Config-driven via `LightningCLI` and `configs/train.yaml` (e.g. `bf16-mixed`, `accumulate_grad_batches`, EarlyStopping, ModelCheckpoint).
 
-- **Scheduled sampling (optional):** When `ss_enabled: true`, training can mix **teacher forcing** with short **autoregressive unrolls**: at each unroll step, with probability *p* the model feeds back its own prediction (otherwise ground truth). This is aligned with inference rollout:
-  - **Frequency features** for predicted tokens are recomputed from the same time token (FFT magnitude, log1p, first 8 bins), matching `autoregressive_rollout.py` and the dataset — no zero tensors, so train and inference see the same input distribution.
-  - **Start position** can be restricted to the last X% of the sequence via `ss_focus_fraction` (default 1.0 = full range; e.g. 0.3 focuses on the merger region).
-  - Config: `ss_warmup_steps`, `ss_p_start`, `ss_p_end`, `ss_unroll_steps`, `ss_detach_pred`, `ss_use_cache`, `ss_focus_fraction`. With `ss_enabled: false`, behavior is unchanged.
+- **Scheduled sampling (optional):** When `ss_enabled: true`, training adds short **autoregressive unrolls** on top of teacher-forced loss: from a random start (optionally in the last `ss_focus_fraction` of the sequence), the model unrolls `ss_unroll_steps` tokens, at each step feeding back its own prediction with probability *p* (linearly annealed from `ss_p_start` to `ss_p_end` over `ss_warmup_steps`). Frequency features for predicted tokens are recomputed with `freq_features_from_tokens` (same as dataset and rollout). Optional `ss_use_cache` uses the model’s KV-cache during unroll; `ss_detach_pred` detaches fed-back predictions for stability.
 
-- **Evaluation:** `eval_and_plot.py` loads a checkpoint and either (1) **teacher-forced** evaluation or (2) **autoregressive rollout** (context window in seconds/tokens, then generate future tokens). It computes maximised noise-weighted overlap (time and phase), supports PSD from CSV or analytic ET-D, and writes overlap statistics and plots (histograms, CDF, mismatch vs parameters, worst-k waveforms).
+- **Evaluation:** `eval_and_plot.py` — teacher-forced or **autoregressive rollout** (context window in seconds, then generate future tokens); maximised noise-weighted overlap, PSD from CSV or analytic ET-D; overlap statistics and plots. `autoregressive_rollout.py` — load checkpoint, run rollout on test data, optional PyCBC match/mismatch and comparison plot.
 
 ---
 
@@ -42,7 +46,7 @@ Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A caus
 
 - **Train:**  
   `python main.py fit --config configs/train.yaml`  
-  (set `data.init_args.data_dir` to your HDF5 directory.)
+  Set `data.init_args.data_dir` to your HDF5 directory; tune `data.init_args.n_files`, `max_samples`, `batch_size`, and model/data `freq_*` so they match.
 
 - **Evaluate (e.g. autoregressive overlap):**  
   `python eval_and_plot.py --ckpt <path>.ckpt --data_dir <path> --mode rollout --context_s 0.5 --future_s 0.25 --psd et_analytic --out_dir results/rollout`
@@ -53,9 +57,10 @@ Autoregressive surrogate model for **gravitational-wave (GW) waveforms**. A caus
 
 - `main.py` — Lightning CLI entrypoint (fit/validate/test).
 - `eval_and_plot.py` — Overlap evaluation and plotting (teacher + rollout).
-- `configs/train.yaml` — Training and data config.
-- `datasets/data_handling.py` — `MergerWindowDataset`, `GWDataModule`, worker init.
-- `models/models.py` — GPT, token embeddings, RoPE, stitcher.
-- `models/lightning_module.py` — `GPTLightning` (loss, optimizers, logging).
+- `autoregressive_rollout.py` — Rollout script with optional PyCBC match and plots.
+- `configs/train.yaml` — Training and data config (model, data, trainer).
+- `datasets/data_handling.py` — `freq_features_from_tokens`, `MergerWindowDataset`, `GWDataModule`, `_worker_init`.
+- `models/models.py` — GPT, TokenEmbedding, FreqMLPEmbed, RoPE, AdaLayerNorm, CausalStitcher1D, KV-cache.
+- `models/lightning_module.py` — `GPTLightning` (loss, optimizers, scheduled sampling, logging).
 
 Data (HDF5) and checkpoints are not in the repo; point `data_dir` and `--ckpt` to your own paths.

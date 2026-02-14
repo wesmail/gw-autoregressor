@@ -237,8 +237,10 @@ def main():
     p.add_argument("--fs", type=float, default=4096.0, help="Sample rate [Hz] for match/mismatch")
     p.add_argument("--f_low", type=float, default=20.0, help="Low-frequency cutoff [Hz] for PSD/match")
     p.add_argument("--no_match", action="store_true", help="Skip PyCBC match/mismatch computation")
-    p.add_argument("--freq_keep_bins", type=int, default=8, help="Frequency bins for x_freq (match MergerWindowDataset)")
+    p.add_argument("--freq_keep_bins", type=int, default=4, help="Frequency bins for x_freq (match MergerWindowDataset)")
+    p.add_argument("--freq_norm", type=str, default="mean", help="Frequency normalization for x_freq (match MergerWindowDataset)")
     p.add_argument("--no_freq_log1p", action="store_true", help="Disable log1p on FFT mags (dataset uses log1p by default)")
+    p.add_argument("--max_samples", type=int, default=58000, help="Maximum number of samples to use from dataset")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -265,8 +267,11 @@ def main():
         n_samples_per_file=args.n_samples_per_file,
         kernel_size=K,
         stride=K,
+        freq_keep_bins=args.freq_keep_bins,
+        freq_norm=args.freq_norm,
         batch_size=32,
         num_workers=0,
+        max_samples=args.max_samples,
     )
     dm.setup("test")
     test_loader = dm.test_dataloader()
@@ -320,20 +325,20 @@ def main():
     t_full = np.arange(len(y_true_full))
     t_fut = np.arange(L_ctx, L_ctx + len(y_pred_rollout))
 
-    ax[0].plot(t_full, y_true_full[:, 0], color="gray", alpha=0.7, label="True (full)")
+    ax[0].plot(t_full, y_true_full[:, 0], color="gray", lw=0.6, alpha=0.4, label="True (full)")
     ax[0].axvline(L_ctx, color="k", ls="--", alpha=0.7, label="Context end")
-    ax[0].plot(t_fut, y_true_future[:, 0], color="tab:orange", label="True future")
-    ax[0].scatter(t_fut, y_pred_rollout[:, 0], color="tab:blue", marker="x", s=1, label=f"Pred future ({args.mode})")
+    ax[0].plot(t_fut, y_true_future[:, 0], lw=0.6, color="tab:orange", label="True future")
+    ax[0].scatter(t_fut, y_pred_rollout[:, 0], color="tab:blue", marker="x", s=1, alpha=0.5, label=f"Pred future ({args.mode})")
     ax[0].set_ylabel("h₊")
     ax[0].legend(loc="upper right")
     ax[0].grid(alpha=0.3)
     if args.xlim_left is not None or args.xlim_right is not None:
         ax[0].set_xlim(left=args.xlim_left, right=args.xlim_right)
 
-    ax[1].plot(t_full, y_true_full[:, 1], color="gray", alpha=0.7)
+    ax[1].plot(t_full, y_true_full[:, 1], color="gray", lw=0.6, alpha=0.4)
     ax[1].axvline(L_ctx, color="k", ls="--", alpha=0.7)
-    ax[1].plot(t_fut, y_true_future[:, 1], color="tab:orange")
-    ax[1].scatter(t_fut, y_pred_rollout[:, 1], color="tab:blue", marker="x", s=1, label="Pred future (rollout)")
+    ax[1].plot(t_fut, y_true_future[:, 1], lw=0.6, color="tab:orange")
+    ax[1].scatter(t_fut, y_pred_rollout[:, 1], color="tab:blue", marker="x", s=1, alpha=0.5, label="Pred future (rollout)")
     ax[1].set_ylabel("h×")
     ax[1].set_xlabel("Time samples")
     ax[1].grid(alpha=0.3)
@@ -348,7 +353,7 @@ def main():
         title += f"\noverlap_max = {match_result['match_avg']:.6f}  |  mismatch = {match_result['mismatch_avg']:.6e}"
     plt.suptitle(title)
     plt.tight_layout()
-    plt.savefig(args.out, dpi=300)
+    plt.savefig(args.out, dpi=600)
     plt.close()
     print(f"Saved {args.out}")
 

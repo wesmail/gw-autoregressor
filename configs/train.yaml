@@ -49,7 +49,11 @@ model:
     token_cnn_layers: 4
     token_cnn_dilation_growth: 2
     token_cnn_dropout: 0.0
-    fusion_type: "add"
+    fusion_type: "concat"
+    freq_embed_type: "mlp"    # "mlp" (lightweight) or "conv" (legacy)
+    freq_keep_bins: 4
+    freq_norm: "mean"         # must match data; "none" | "mean" | "l2"
+    freq_log1p: true
     # Post-head stitcher
     use_stitcher: true
     stitcher_hidden: 64
@@ -79,10 +83,10 @@ model:
     ss_warmup_steps: 2000         # linearly anneal p from p_start → p_end over this many steps
     ss_p_start: 0.0               # initial probability of feeding back own prediction
     ss_p_end: 0.2                 # final probability
-    ss_unroll_steps: 2            # number of autoregressive steps per training batch (2–8 rec.)
+    ss_unroll_steps: 20           # number of autoregressive steps per training batch (2–8 rec.)
     ss_detach_pred: true          # detach predicted tokens when feeding back (stable/minimal)
     ss_use_cache: false           # use KV-cache during unroll (optional speedup, experimental)
-    ss_focus_fraction: 0.8        # 1.0 = uniform start; <1.0 = sample from last X% (e.g. merger)
+    ss_focus_fraction: 0.7        # 1.0 = uniform start; <1.0 = sample from last X% (e.g. merger)
 
 data:
   class_path: datasets.data_handling.GWDataModule
@@ -94,3 +98,7 @@ data:
     n_samples_per_file: 10000
     batch_size: 16
     num_workers: 16
+    freq_keep_bins: 4
+    freq_log1p: true
+    freq_norm: "mean"   # "none" | "mean" | "l2"
+    max_samples: 57500  # max time samples per waveform (null = no cap)

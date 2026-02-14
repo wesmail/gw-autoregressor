@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from lightning.pytorch import LightningModule
 
 from .models import GPT, print_flash_attention_status, compile_model
+from datasets.data_handling import freq_features_from_tokens
 
 # =============================================================================
 # Log-Cosh Loss
@@ -60,6 +61,11 @@ class GPTLightning(LightningModule):
         # Loss
         time_loss: str = "l1",
         fusion_type: str = "cross_attention",
+        # frequency branch (must match data)
+        freq_embed_type: str = "mlp",   # "mlp" or "conv" (legacy)
+        freq_keep_bins: int = 8,
+        freq_norm: str = "none",        # "none" | "mean" | "l2" — must match dataset
+        freq_log1p: bool = True,
         # conditioning
         theta_dim: int = 0,
         cond_dim: int = 128,
@@ -118,10 +124,15 @@ class GPTLightning(LightningModule):
             stitcher_layers=stitcher_layers,
             stitcher_dropout=stitcher_dropout,
             fusion_type=fusion_type,
+            freq_embed_type=freq_embed_type,
+            freq_keep_bins=freq_keep_bins,
             theta_dim=theta_dim,
             cond_dim=cond_dim,
             cond_hidden=cond_hidden,
         )
+        self.freq_keep_bins = freq_keep_bins
+        self.freq_norm = freq_norm
+        self.freq_log1p = freq_log1p
         
         # Optional: torch.compile() for additional speedup (PyTorch 2.0+)
         self.use_torch_compile = use_torch_compile
@@ -158,15 +169,16 @@ class GPTLightning(LightningModule):
     # =================================================================
     def _compute_freq_features(self, tokens: torch.Tensor) -> torch.Tensor:
         """
-        Per-token FFT magnitude from time tokens. Matches MergerWindowDataset._freq_features
-        and autoregressive_rollout.freq_features_from_tokens for train–inference consistency.
+        Per-token FFT magnitude from time tokens. Uses shared freq_features_from_tokens
+        so train / inference / dataset stay in sync (freq_norm, freq_log1p).
         tokens: [B, T, C, K] -> [B, T, C, F]
         """
-        freq_keep_bins = 8
-        mag = torch.fft.rfft(tokens, dim=-1).abs()
-        mag = torch.log1p(mag)
-        Fkeep = min(freq_keep_bins, mag.shape[-1])
-        return mag[..., :Fkeep]
+        return freq_features_from_tokens(
+            tokens,
+            freq_keep_bins=self.freq_keep_bins,
+            freq_log1p=self.freq_log1p,
+            freq_norm=self.freq_norm,
+        )
 
     # =================================================================
     # Scheduled sampling probability (linear anneal)
